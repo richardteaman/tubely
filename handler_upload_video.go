@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -90,6 +94,36 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	aspectRatio, err := getVideoAspectRatio(outFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't determine video's aspect ratio", err)
+		return
+	}
+
+	var aspectPrefix string
+	switch aspectRatio {
+	case "16:9":
+		aspectPrefix = "landscape/"
+	case "9:16":
+		aspectPrefix = "portrait/"
+	default:
+		aspectPrefix = "other/"
+	}
+
+	processedFilePath, err := processVideoForFastStart(outFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't generate processed video path", err)
+		return
+	}
+
+	processedFile, err := os.Open(processedFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't open processed file", err)
+		return
+	}
+	defer os.Remove(processedFilePath)
+	defer processedFile.Close()
+
 	randomBytes := make([]byte, 32)
 	n, err := rand.Read(randomBytes)
 	if err != nil {
@@ -103,12 +137,12 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	filenameHex := hex.EncodeToString(randomBytes)
 	ext := filepath.Ext(header.Filename)
-	key := filenameHex + ext
+	key := aspectPrefix + filenameHex + ext
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
 		Key:         &key,
-		Body:        outFile,
+		Body:        processedFile,
 		ContentType: &mediaType,
 		//ACL:         types.ObjectCannedACLPublicRead,
 	})
@@ -117,7 +151,10 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	VideolURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, key)
+	//VideolURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, key)
+	//VideolURL := fmt.Sprintf("%s,%s", cfg.s3Bucket, key) // for use with presigned URL's
+	VideolURL := fmt.Sprintf("https://%s/%s", cfg.s3CfDistribution, key) // for use with presigned URL's
+
 	video.VideoURL = &VideolURL
 
 	err = cfg.db.UpdateVideo(video)
@@ -126,5 +163,94 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	/*
+		signedVideo, err := cfg.dbVideoToSignedVideo(video)
+		if err != nil {
+			respondWithError(w, http.StatusInternalServerError, "Failed to retrive signed video", err)
+			return
+		}
+	*/
+
 	respondWithJSON(w, http.StatusOK, video)
 }
+
+func getVideoAspectRatio(filePath string) (string, error) {
+
+	//commandStr := fmt.Sprintf("ffprobe -v error -print_format json -show_streams %s",filePath)
+	//cmd := exec.Command(commandStr)
+	cmd := exec.Command("ffprobe",
+		"-v", "error", "-print_format",
+		"json", "-show_streams",
+		filePath,
+	)
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+
+	type stream struct {
+		Width  int `json:"width"`
+		Height int `json:"height"`
+	}
+
+	type ffprobeOutput struct {
+		Streams []stream `json:"streams"`
+	}
+
+	var result ffprobeOutput
+	err = json.Unmarshal(out.Bytes(), &result)
+	if err != nil {
+		return "", err
+	}
+
+	if len(result.Streams) < 1 {
+		return "", fmt.Errorf("empty video streams")
+	}
+
+	width := result.Streams[0].Width
+	height := result.Streams[0].Height
+
+	aspectRatio := float64(width) / float64(height)
+	const toleracne = 0.05
+
+	switch {
+	case math.Abs(aspectRatio-1.777) < toleracne:
+		return "16:9", nil
+	case math.Abs(aspectRatio-0.5625) < toleracne:
+		return "9:16", nil
+	default:
+		return "other", nil
+	}
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	out := filePath + ".processing"
+
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", out)
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+
+	return out, nil
+}
+
+/*
+func generatePresignedURL(s3Client *s3.Client, bucket, key string, expireTime time.Duration) (string, error) {
+	presignClient := s3.NewPresignClient(s3Client)
+
+	req, err := presignClient.PresignGetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	}, s3.WithPresignExpires(expireTime))
+	if err != nil {
+		return "", err
+	}
+
+	return req.URL, nil
+}
+*/

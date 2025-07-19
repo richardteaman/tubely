@@ -28,13 +28,27 @@ type apiConfig struct {
 }
 
 /*
-type thumbnail struct {
-	data      []byte
-	mediaType string
+func (cfg *apiConfig) dbVideoToSignedVideo(video database.Video) (database.Video, error) {
+	if video.VideoURL == nil {
+		return video, nil
+	}
+
+	parts := strings.SplitN(*video.VideoURL, ",", 2)
+	if len(parts) != 2 {
+		return video, fmt.Errorf("invalid video_url format")
+	}
+
+	bucket := parts[0]
+	key := parts[1]
+
+	presignedStr, err := generatePresignedURL(cfg.s3Client, bucket, key, 30*time.Minute)
+	if err != nil {
+		log.Fatalf("Couldn't generate signed URL :%v", err)
+	}
+
+	video.VideoURL = &presignedStr
+	return video, nil
 }
-
-
-var videoThumbnails = map[uuid.UUID]thumbnail{}
 */
 
 func main() {
